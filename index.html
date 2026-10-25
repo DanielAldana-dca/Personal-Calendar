@@ -760,6 +760,20 @@ h2, h3 {
     scroll-behavior: auto !important;
   }
 }
+
+
+/* Arrastrar tareas y marcar recurrencias */
+.day.drop-target { outline: 4px dashed #2457ff; outline-offset: -5px; background: #dbe5ff; }
+.task[draggable="true"] { cursor: grab; }
+.task.dragging { opacity: .4; }
+.task.recurrent-task { border-style: dashed; background: #fff6b0; }
+.task.recurrent-task[draggable="false"] { cursor: default; }
+.tag.recurrent-tag { background: #2457ff; color: white; }
+.recurrence-field { border: 2px dashed var(--ink); padding: 10px; }
+.recurrence-toggle { display: flex; align-items: center; gap: 9px; cursor: pointer; }
+.recurrence-toggle input { width: auto; accent-color: var(--orange); }
+#repeatDay:disabled { opacity: .5; }
+
 </style>
 </head>
 
@@ -870,6 +884,19 @@ h2, h3 {
             </select>
           </div>
 
+          <div class="field recurrence-field">
+            <label class="recurrence-toggle"><input id="repeatWeekly" type="checkbox"> Repetir cada semana</label>
+            <select id="repeatDay" aria-label="Día de repetición semanal" disabled>
+              <option value="1">Todos los lunes</option>
+              <option value="2">Todos los martes</option>
+              <option value="3">Todos los miércoles</option>
+              <option value="4">Todos los jueves</option>
+              <option value="5">Todos los viernes</option>
+              <option value="6">Todos los sábados</option>
+              <option value="0">Todos los domingos</option>
+            </select>
+          </div>
+
           <div class="form-actions">
             <button id="submitTask" class="primary" type="submit">Añadir tarea</button>
             <button id="cancelEdit" class="secondary hidden" type="button">Cancelar edición</button>
@@ -949,6 +976,7 @@ h2, h3 {
  */
 
 const STORAGE_KEY = "tareas-brutal-v1";
+const RECURRENCE_STORAGE_KEY = "tareas-brutal-recurrentes-v1";
 const LEGACY_KEYS = ["tareas-brutal-v1"];
 
 const $ = (id) => document.getElementById(id);
@@ -965,6 +993,8 @@ const PRIORITY_ORDER = {
 };
 
 let data = {};
+let recurrentes = [];
+let draggedTaskId = null;
 let currentDate = new Date();
 let selectedKey = dateKey(new Date());
 let activeFilter = "todas";
@@ -1047,7 +1077,69 @@ function uid() {
 }
 
 function getTasks(key = selectedKey) {
-  return Array.isArray(data[key]) ? data[key] : [];
+  const storedTasks = Array.isArray(data[key]) ? data[key] : [];
+  const date = parseDateKey(key);
+  if (!date) return storedTasks;
+
+  const weeklyTasks = recurrentes
+    .filter(item => item.activa !== false && item.diaSemana === date.getDay())
+    .map(item => ({
+      id: "recurring:" + item.id,
+      recurrenteId: item.id,
+      texto: item.texto,
+      hecha: Boolean(item.hechas && item.hechas[key]),
+      prioridad: item.prioridad || "normal",
+      actualizada: item.actualizada || "",
+      recurrente: true
+    }));
+
+  return storedTasks.concat(weeklyTasks);
+}
+
+function loadRecurrences() {
+  try {
+    const raw = localStorage.getItem(RECURRENCE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    recurrentes = Array.isArray(parsed) ? parsed.filter(item =>
+      item && typeof item.id === "string" && typeof item.texto === "string"
+      && item.texto.trim() && Number.isInteger(item.diaSemana)
+      && item.diaSemana >= 0 && item.diaSemana <= 6
+    ).map(item => ({
+      id: item.id, texto: item.texto.trim(),
+      prioridad: ["alta", "normal", "baja"].includes(item.prioridad) ? item.prioridad : "normal",
+      diaSemana: item.diaSemana, activa: item.activa !== false,
+      hechas: item.hechas && typeof item.hechas === "object" ? item.hechas : {},
+      actualizada: item.actualizada || new Date().toISOString()
+    })) : [];
+  } catch (error) {
+    console.error("No se pudieron cargar las tareas recurrentes:", error);
+    recurrentes = [];
+    showToast("No se pudieron cargar las tareas recurrentes.", true);
+  }
+}
+
+function saveRecurrences(nextRecurrences) {
+  const previous = recurrentes;
+  recurrentes = nextRecurrences;
+  try {
+    localStorage.setItem(RECURRENCE_STORAGE_KEY, JSON.stringify(recurrentes));
+    return true;
+  } catch (error) {
+    recurrentes = previous;
+    showToast("No se pudieron guardar las tareas recurrentes.", true);
+    return false;
+  }
+}
+
+function toggleRecurringTask(id, key = selectedKey) {
+  const next = JSON.parse(JSON.stringify(recurrentes));
+  const item = next.find(task => task.id === id);
+  if (!item) return;
+  item.hechas = item.hechas || {};
+  if (item.hechas[key]) delete item.hechas[key];
+  else item.hechas[key] = true;
+  saveRecurrences(next);
+  renderAll();
 }
 
 function normaliseTask(task) {
@@ -1267,6 +1359,17 @@ function renderCalendar() {
     }
 
     cell.addEventListener("click", () => selectDate(key));
+    cell.addEventListener("dragover", event => {
+      if (!draggedTaskId) return;
+      event.preventDefault();
+      cell.classList.add("drop-target");
+    });
+    cell.addEventListener("dragleave", () => cell.classList.remove("drop-target"));
+    cell.addEventListener("drop", event => {
+      event.preventDefault();
+      cell.classList.remove("drop-target");
+      if (draggedTaskId) moveTaskToDate(draggedTaskId, key);
+    });
 
     grid.appendChild(cell);
   }
@@ -1367,6 +1470,23 @@ function renderTasks() {
   for (const task of visible) {
     const li = document.createElement("li");
     li.className = "task";
+    if (task.recurrente) {
+      li.classList.add("recurrent-task");
+      li.draggable = false;
+    } else {
+      li.draggable = true;
+      li.addEventListener("dragstart", event => {
+        draggedTaskId = task.id;
+        li.classList.add("dragging");
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", task.id);
+      });
+      li.addEventListener("dragend", () => {
+        draggedTaskId = null;
+        li.classList.remove("dragging");
+        document.querySelectorAll(".day.drop-target").forEach(day => day.classList.remove("drop-target"));
+      });
+    }
 
     if (task.hecha) li.classList.add("completed");
 
@@ -1376,7 +1496,9 @@ function renderTasks() {
     check.checked = task.hecha;
     check.setAttribute("aria-label", "Marcar como completada: " + task.texto);
 
-    check.addEventListener("change", () => toggleTask(task.id));
+    check.addEventListener("change", () => task.recurrente
+      ? toggleRecurringTask(task.recurrenteId)
+      : toggleTask(task.id));
 
     const main = document.createElement("div");
     main.className = "task-main";
@@ -1396,14 +1518,22 @@ function renderTasks() {
     edit.className = "icon-btn";
     edit.textContent = "Editar";
     edit.setAttribute("aria-label", "Editar tarea: " + task.texto);
-    edit.addEventListener("click", () => startEditing(task.id));
+    edit.disabled = task.recurrente;
+    if (task.recurrente) edit.title = "Edita o elimina esta recurrencia desde su configuración";
+    else edit.addEventListener("click", () => startEditing(task.id));
 
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "icon-btn delete";
     remove.textContent = "Eliminar";
     remove.setAttribute("aria-label", "Eliminar tarea: " + task.texto);
-    remove.addEventListener("click", () => deleteTask(task.id));
+    if (task.recurrente) {
+      remove.textContent = "Quitar";
+      remove.setAttribute("aria-label", "Desactivar tarea recurrente: " + task.texto);
+      remove.addEventListener("click", () => deactivateRecurrence(task.recurrenteId));
+    } else {
+      remove.addEventListener("click", () => deleteTask(task.id));
+    }
 
     actions.append(edit, remove);
     top.append(text, actions);
@@ -1420,9 +1550,47 @@ function renderTasks() {
     status.textContent = task.hecha ? "Completada" : "Pendiente";
 
     meta.append(priority, status);
+    if (task.recurrente) {
+      const recurringTag = document.createElement("span");
+      recurringTag.className = "tag recurrent-tag";
+      recurringTag.textContent = "Recurrente semanal";
+      meta.appendChild(recurringTag);
+    }
     main.append(top, meta);
     li.append(check, main);
     list.appendChild(li);
+  }
+}
+
+function moveTaskToDate(id, destinationKey) {
+  if (!isValidDateKey(destinationKey) || destinationKey === selectedKey) return;
+  const sourceList = data[selectedKey] || [];
+  const task = sourceList.find(item => item.id === id);
+  if (!task) return;
+
+  const next = cloneData(data);
+  next[selectedKey] = (next[selectedKey] || []).filter(item => item.id !== id);
+  if (!next[selectedKey].length) delete next[selectedKey];
+  next[destinationKey] = next[destinationKey] || [];
+  next[destinationKey].push({ ...task, actualizada: new Date().toISOString() });
+
+  if (!commitData(next)) return;
+  selectedKey = destinationKey;
+  const date = parseDateKey(destinationKey);
+  setCalendarMonth(date.getFullYear(), date.getMonth());
+  cancelEditing(false);
+  renderAll();
+  showToast("Tarea movida al " + formatDate(destinationKey) + ".");
+}
+
+function deactivateRecurrence(id) {
+  const item = recurrentes.find(task => task.id === id);
+  if (!item) return;
+  if (!confirm("¿Dejar de mostrar la tarea recurrente «" + item.texto + "»?")) return;
+  const next = recurrentes.map(task => task.id === id ? { ...task, activa: false } : task);
+  if (saveRecurrences(next)) {
+    renderAll();
+    showToast("Tarea recurrente desactivada.");
   }
 }
 
@@ -1461,6 +1629,10 @@ function goToToday() {
 function resetForm() {
   $("taskInput").value = "";
   $("priorityInput").value = "normal";
+  $("repeatWeekly").checked = false;
+  $("repeatDay").disabled = true;
+  const selectedDate = parseDateKey(selectedKey) || new Date();
+  $("repeatDay").value = String(selectedDate.getDay());
 }
 
 function addTask(text, priority) {
@@ -1542,6 +1714,22 @@ function updateTask(id, text, priority) {
   return true;
 }
 
+$("repeatWeekly").addEventListener("change", () => {
+  $("repeatDay").disabled = !$("repeatWeekly").checked;
+});
+
+function addRecurringTask(text, priority, dayOfWeek) {
+  const next = recurrentes.concat({
+    id: uid(), texto: text, prioridad: priority, diaSemana: dayOfWeek,
+    activa: true, hechas: {}, actualizada: new Date().toISOString()
+  });
+  if (!saveRecurrences(next)) return false;
+  resetForm();
+  renderAll();
+  showToast("Tarea recurrente semanal añadida.");
+  return true;
+}
+
 $("taskForm").addEventListener("submit", event => {
   event.preventDefault();
 
@@ -1565,6 +1753,13 @@ $("taskForm").addEventListener("submit", event => {
 
   if (editingId) {
     updateTask(editingId, text, priority);
+  } else if ($("repeatWeekly").checked) {
+    const dayOfWeek = Number($("repeatDay").value);
+    if (!Number.isInteger(dayOfWeek) || dayOfWeek < 0 || dayOfWeek > 6) {
+      showToast("Selecciona un día de repetición válido.", true);
+      return;
+    }
+    addRecurringTask(text, priority, dayOfWeek);
   } else {
     addTask(text, priority);
   }
@@ -1797,6 +1992,7 @@ function hideToast() {
 /* ---------- Inicialización ---------- */
 
 loadData();
+loadRecurrences();
 
 const initialDate = parseDateKey(selectedKey) || new Date();
 setCalendarMonth(initialDate.getFullYear(), initialDate.getMonth());
